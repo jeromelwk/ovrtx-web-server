@@ -1,13 +1,24 @@
-"""ovrtx/ovstage integration: owns the renderer, the currently opened USD scene,
+"""ovrtx/ovstage integration: owns the renderer, the attached ovstage stage,
 the orbit camera, and per-frame RTX rendering + picking.
 
-Runs ovrtx in **standalone** mode (no ovstage attach): the composite scene is
-opened directly on the renderer via the synchronous, deprecated-but-fully-
-functional ``Renderer.open_usd_from_string`` / ``query_prims`` / ``read_attribute``
-/ ``write_attribute`` convenience API. This avoids the ordinal/write-floor/
-async-handle bookkeeping that the newer ovstage-attached workflow requires,
-which is unnecessary complexity for a single-session interactive viewer.
-Deprecation warnings are suppressed via ``RendererConfig``.
+Runs ovrtx **attached** to an ``ovstage.Stage`` (``Renderer.attach_ovstage``).
+This turned out to be necessary only for two things:
+
+- ``ovstage.population.update_from_usd_time`` -- the *actually* supported way
+  to re-evaluate time-sampled attributes. The deprecated standalone
+  ``Renderer.update_from_usd_time`` was empirically found to leave computed
+  transforms frozen on the last authored keyframe no matter what time was
+  requested.
+- Reading/writing attribute *values* once attached: ``Renderer.read_attribute``
+  / ``write_attribute`` are rejected outright once a stage is attached
+  ("not supported while attached to an ovstage in borrow mode").
+
+``Renderer.query_prims`` (discovery: which prims exist, their attribute
+schemas, filtering by type) was empirically confirmed to keep working fine
+even while attached, so scene-graph/property discovery below is unchanged
+from the pre-migration standalone implementation -- only attribute reads,
+writes, population and the animation clock now go through the native
+``ovstage`` API.
 """
 
 from __future__ import annotations
@@ -24,6 +35,7 @@ import numpy as np
 from PIL import Image
 
 import ovrtx
+import ovstage
 from ovrtx import AttributeFilterMode, Device, FilterKind, RendererConfig, Semantic
 
 log = logging.getLogger("ovrtx_server.render_session")
@@ -53,6 +65,10 @@ GIZMO_HEAD_LENGTH = 0.28
 GIZMO_SCALE_FACTOR = 0.05  # world-space gizmo size per unit of camera distance
 
 _SELECTION_GROUP = 1  # ovrtx selection-outline group id used for the selected prim
+
+ANIM_DEFAULT_DURATION = 10.0  # seconds; ovrtx has no API to read a stage's authored
+# startTimeCode/endTimeCode/timeCodesPerSecond, so the timeline uses this fixed
+# default range rather than one derived from the file.
 
 # Prims authored by us to host the camera / render config / fallback lighting /
 # move gizmo, plus internal bookkeeping prims injected by the ovrtx/Fabric
@@ -161,15 +177,37 @@ def _jsonable(value: Any):
 
 
 class RenderSession:
-    """Single global viewer session: one renderer, one open scene at a time."""
+    """Single global viewer session: one renderer attached to one ovstage
+    stage, one open scene at a time."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self.renderer: Optional[ovrtx.Renderer] = None
+        self.stage: Optional[ovstage.Stage] = None
+        self.path_dict: Optional[ovstage.PathDictionary] = None
+        # `_ordinal_counter` hands out fresh ordinal numbers and always keeps
+        # climbing, even for a write that then fails -- ordinals only need to
+        # be unique, not all consumed. `self.ordinal` is the separate "last
+        # ordinal actually committed to the write floor" tracker that step()
+        # uses; it must NOT advance just because a number was handed out, or
+        # a single failed write (e.g. a RenderProduct resize, which can
+        # legitimately be rejected) would leave step() pointing past what the
+        # floor actually reached, and every subsequent step() would fail with
+        # "ordinal exceeds ovstage write floor" forever after.
+        self._ordinal_counter = 0
+        self.ordinal = 0
         self.is_open = False
         self.width = 960
         self.height = 540
         self.source_path: Optional[str] = None
+
+        # Per-path Query handles (and the PathList each one borrows), reused
+        # across ovstage reads/writes to the same prim instead of re-resolving
+        # a path every call; released and rebuilt on every new scene open,
+        # since old paths become meaningless once the root layer is replaced.
+        self._path_queries: dict[str, Any] = {}
+        self._path_lists: dict[str, Any] = {}
+        self._token_cache: dict[str, int] = {}
 
         self.prim_attrs: dict[str, dict[str, Any]] = {}
         self.prim_types: dict[str, str] = {}
@@ -193,8 +231,15 @@ class RenderSession:
         self._gizmo_shown = False
         self._outlined_path: Optional[str] = None
 
+        # Animation playback state.
+        self.anim_time = 0.0
+        self.anim_duration = ANIM_DEFAULT_DURATION
+        self.anim_playing = False
+        self.anim_unsafe = False
+        self._anim_dirty = True
+
     # ------------------------------------------------------------------
-    # Renderer / scene lifecycle
+    # Renderer / stage lifecycle
     # ------------------------------------------------------------------
     def _ensure_renderer(self) -> None:
         if self.renderer is None:
@@ -206,26 +251,127 @@ class RenderSession:
                 selection_fill_mode=ovrtx.SelectionFillMode.EDGE_ONLY,
             )
             self.renderer = ovrtx.Renderer(config=cfg)
+        if self.stage is None:
+            self.stage = ovstage.Stage("ovrtx_web_server")
+            # Attach *before* the first population: attaching after a stage has
+            # already been populated was observed to crash the native renderer
+            # on the very next step().
+            self.renderer.attach_ovstage(self.stage)
+            self.path_dict = ovstage.PathDictionary(self.stage)
             self.renderer.set_selection_group_styles({
                 _SELECTION_GROUP: ovrtx.SelectionGroupStyle(
                     outline_color=(0.906, 0.318, 0.075, 1.0), fill_color=(0.0, 0.0, 0.0, 0.0)
                 ),
             })
 
+    def _next_ordinal(self) -> int:
+        self._ordinal_counter += 1
+        return self._ordinal_counter
+
+    def _release_path_queries(self) -> None:
+        for query in self._path_queries.values():
+            try:
+                self.stage.release_query(query).wait()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+        for plist in self._path_lists.values():
+            try:
+                self.path_dict.destroy_path_list(plist)
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+        self._path_queries.clear()
+        self._path_lists.clear()
+
+    def _get_query(self, path: str):
+        query = self._path_queries.get(path)
+        if query is None:
+            plist = self.path_dict.create_path_list_from_strings([path])
+            query = self.stage.query_from_path_list(plist)
+            self._path_queries[path] = query
+            self._path_lists[path] = plist
+        return query
+
+    def _get_token(self, name: str) -> int:
+        token = self._token_cache.get(name)
+        if token is None:
+            token = self.path_dict.intern_token(name)
+            self._token_cache[name] = token
+        return token
+
+    def _write(self, path: str, name: str, tensor, is_array: bool = False, semantic: int = 0) -> None:
+        """Write one attribute's value on one prim through the native ovstage
+        API (required once attached: the deprecated Renderer.write_attribute
+        is rejected outright)."""
+        ordinal = self._next_ordinal()
+        query = self._get_query(path)
+        self.stage.write_attribute(query, name, ordinal, tensor, is_array=is_array, semantic=semantic).wait()
+        self.stage.advance_write_floor(ordinal=ordinal).wait()
+        self.ordinal = ordinal
+
+    def _write_token(self, path: str, name: str, value: str) -> None:
+        """Write a token-valued attribute (e.g. 'visibility'). Unlike the
+        deprecated Renderer.write_attribute, the native ovstage write does not
+        auto-detect a plain string/list[str] as a token write -- the value
+        must be pre-interned and tagged with the TOKEN_ID semantic."""
+        token = self._get_token(value)
+        arr = np.array([token], dtype=np.uint64)
+        self._write(path, name, arr, is_array=False, semantic=ovstage.AttributeSemantic.TOKEN_ID)
+
+    def _read_one(self, path: str, name: str) -> np.ndarray:
+        """Read a single attribute's current value off one prim through the
+        native ovstage API. Raises KeyError if it has no data on that prim."""
+        query = self._get_query(path)
+        token = self._get_token(name)
+        read = self.stage.read_attributes(query, [token], ovstage.OrdinalRange.latest(self.ordinal))
+        read.wait()
+        try:
+            group = read.fetch_next()
+            if group is None:
+                raise KeyError(f"No data for {name!r} on {path}")
+            try:
+                return np.array(group.array(0))
+            finally:
+                self.stage.release_group(group)
+        finally:
+            self.stage.release_read(read).wait()
+
     def open_usd(self, path: str, width: int, height: int) -> None:
         with self._lock:
             self._ensure_renderer()
+            self._release_path_queries()
+            self._token_cache.clear()
+
             self.width = max(64, int(width))
             self.height = max(64, int(height))
             usda = self._build_composite_usda(path)
-            self.renderer.open_usd_from_string(usda)
+            ordinal = self._next_ordinal()
+            ovstage.population.open_usd_from_string(self.stage, usda, ordinal=ordinal)
+            self.stage.advance_write_floor(ordinal=ordinal).wait()
+            self.ordinal = ordinal
+
             self.source_path = path
             self._refresh_schema()
             self._reset_camera_heuristic()
             self._camera_dirty = True
             self.selected_path = None
+            self.last_transform = {}
+            self._gizmo_state = None
+            self._gizmo_shown = False
+            self._outlined_path = None
+            self.anim_time = 0.0
+            self.anim_playing = False
+            self._anim_dirty = True
+            # Safety guard: driving the animation clock (update_from_usd_time)
+            # on a scene with UsdSkel joint animation was found to reliably
+            # crash the native renderer process in this ovrtx build, even
+            # though the exact same call works correctly for ordinary
+            # translate/rotate/scale keyframe animation. There is no way to
+            # catch or recover from that crash from Python, so playback is
+            # refused up front for any scene containing a Skeleton/SkelRoot,
+            # rather than letting Play silently take the whole server down.
+            self.anim_unsafe = any(t in ("Skeleton", "SkelRoot") for t in self.prim_types.values())
             self.is_open = True
-            log.info("Opened %s (%d prims)", path, len(self.prim_attrs))
+            log.info("Opened %s (%d prims, anim_unsafe=%s)", path, len(self.prim_attrs), self.anim_unsafe)
 
     def _build_composite_usda(self, path: str) -> str:
         src = os.path.abspath(path).replace("\\", "/")
@@ -333,7 +479,8 @@ def Xform "OVGizmo"
 """
 
     # ------------------------------------------------------------------
-    # Scene graph / properties (read-only queries against the runtime stage)
+    # Scene graph / properties (discovery via the still-working deprecated
+    # Renderer.query_prims; values via the native ovstage read/write API)
     # ------------------------------------------------------------------
     def _is_reserved(self, path: str) -> bool:
         if path in ("", "/"):
@@ -428,13 +575,8 @@ def Xform "OVGizmo"
                 if name in skip_names:
                     continue
                 try:
-                    if info["is_array"]:
-                        tensors = self.renderer.read_array_attribute(name, [path])
-                        value = _jsonable(np.from_dlpack(tensors[path]))
-                    else:
-                        tensor = self.renderer.read_attribute(name, [path])
-                        arr = np.from_dlpack(tensor)
-                        value = _jsonable(arr[0] if arr.shape and arr.shape[0] == 1 else arr)
+                    arr = self._read_one(path, name)
+                    value = _jsonable(arr[0] if arr.shape and arr.shape[0] == 1 else arr)
                     value = self._resolve_semantic(info, value)
                 except Exception:  # noqa: BLE001 - some semantics/types aren't readable generically
                     log.debug("Skipping unreadable attribute %r on %s", name, path, exc_info=True)
@@ -459,8 +601,7 @@ def Xform "OVGizmo"
             if name not in attrs:
                 continue
             try:
-                tensor = self.renderer.read_attribute(name, [path])
-                arr = np.asarray(np.from_dlpack(tensor), dtype=np.float64).reshape(-1, 4, 4)[0]
+                arr = self._read_one(path, name).astype(np.float64).reshape(-1, 4, 4)[0]
                 return {"translate": [float(arr[3, 0]), float(arr[3, 1]), float(arr[3, 2])], "rotate": [0.0, 0.0, 0.0]}
             except Exception:  # noqa: BLE001 - best-effort prefill only
                 continue
@@ -479,7 +620,7 @@ def Xform "OVGizmo"
 
     def _write_prim_transform(self, path: str, translate: list[float], rotate_deg: list[float]) -> None:
         matrix = _compose_local_matrix(translate, rotate_deg).reshape(1, 4, 4)
-        self.renderer.write_attribute([path], "omni:xform", matrix, semantic=Semantic.XFORM_MAT4x4)
+        self._write(path, "omni:xform", matrix, is_array=False, semantic=ovstage.AttributeSemantic.MATRIX)
         self.last_transform[path] = {"translate": [float(v) for v in translate], "rotate": [float(v) for v in rotate_deg]}
 
     def _gizmo_axis_from_path(self, path: Optional[str]) -> Optional[str]:
@@ -555,12 +696,7 @@ def Xform "OVGizmo"
             if attr_name not in attrs or self.prim_types.get(path) == "PointInstancer":
                 continue
             try:
-                info = attrs[attr_name]
-                if info["is_array"]:
-                    tensor = self.renderer.read_array_attribute(attr_name, [path])[path]
-                else:
-                    tensor = self.renderer.read_attribute(attr_name, [path])
-                arr = np.asarray(np.from_dlpack(tensor), dtype=np.float64).reshape(-1, 3)
+                arr = self._read_one(path, attr_name).astype(np.float64).reshape(-1, 3)
                 if arr.shape[0] >= 2:
                     mins.append(arr[0])
                     maxs.append(arr[1])
@@ -571,8 +707,7 @@ def Xform "OVGizmo"
             if type_name != "PointInstancer" or "positions" not in self.prim_attrs.get(path, {}):
                 continue
             try:
-                tensor = self.renderer.read_array_attribute("positions", [path])[path]
-                arr = np.asarray(np.from_dlpack(tensor), dtype=np.float64).reshape(-1, 3)
+                arr = self._read_one(path, "positions").astype(np.float64).reshape(-1, 3)
                 if arr.shape[0] >= 1:
                     mins.append(arr.min(axis=0))
                     maxs.append(arr.max(axis=0))
@@ -628,6 +763,17 @@ def Xform "OVGizmo"
                 self.end_gizmo_drag()
             elif kind == "frame_selected":
                 self._frame_selected()
+            elif kind == "anim_play":
+                self.anim_playing = True
+            elif kind == "anim_pause":
+                self.anim_playing = False
+            elif kind == "anim_stop":
+                self.anim_playing = False
+                self.anim_time = 0.0
+                self._anim_dirty = True
+            elif kind == "anim_seek":
+                self.anim_time = max(0.0, min(self.anim_duration, float(msg.get("time", 0.0))))
+                self._anim_dirty = True
 
     def _frame_selected(self) -> None:
         """Re-center and dolly the camera onto the selected prim (the 'F' shortcut)."""
@@ -668,7 +814,7 @@ def Xform "OVGizmo"
             return
         matrix = self._camera_matrix().reshape(1, 4, 4)
         try:
-            self.renderer.write_attribute([CAMERA_PATH], "omni:xform", matrix, semantic=Semantic.XFORM_MAT4x4)
+            self._write(CAMERA_PATH, "omni:xform", matrix, is_array=False, semantic=ovstage.AttributeSemantic.MATRIX)
         except Exception:
             log.exception("Failed to write camera transform")
         self._camera_dirty = False
@@ -679,22 +825,41 @@ def Xform "OVGizmo"
         w, h = self._pending_resize
         self._pending_resize = None
         try:
-            self.renderer.write_attribute([RENDER_PRODUCT_PATH], "resolution", np.array([[w, h]], dtype=np.uint32))
+            self._write(RENDER_PRODUCT_PATH, "resolution", np.array([[w, h]], dtype=np.uint32), is_array=False)
             self.width, self.height = w, h
         except Exception:
             log.warning("Live RenderProduct resize to %dx%d failed; keeping %dx%d", w, h, self.width, self.height)
+
+    def _apply_animation(self, dt: float) -> None:
+        if self.anim_unsafe:
+            # See the comment in open_usd(): update_from_usd_time crashes the
+            # native process on skeletal content, so never call it here even
+            # if a stale "play"/"seek" request is still pending.
+            self.anim_playing = False
+            self._anim_dirty = False
+            return
+        if self.anim_playing:
+            self.anim_time += dt
+            if self.anim_time > self.anim_duration:
+                self.anim_time = self.anim_time % max(self.anim_duration, 1e-6)
+            self._anim_dirty = True
+        if not self._anim_dirty:
+            return
+        try:
+            ordinal = self._next_ordinal()
+            ovstage.population.update_from_usd_time(self.stage, ordinal, self.anim_time)
+            self.stage.advance_write_floor(ordinal=ordinal).wait()
+            self.ordinal = ordinal
+        except Exception:
+            log.exception("Failed to update animation time")
+        self._anim_dirty = False
 
     def _read_extent_world(self, path: str, attrs: dict[str, Any]) -> Optional[np.ndarray]:
         """Read a (2, 3) [min, max] array from the given extent-like attribute."""
         if "_worldExtent" not in attrs:
             return None
         try:
-            info = attrs["_worldExtent"]
-            if info["is_array"]:
-                tensor = self.renderer.read_array_attribute("_worldExtent", [path])[path]
-            else:
-                tensor = self.renderer.read_attribute("_worldExtent", [path])
-            arr = np.asarray(np.from_dlpack(tensor), dtype=np.float64).reshape(-1, 3)
+            arr = self._read_one(path, "_worldExtent").astype(np.float64).reshape(-1, 3)
             if arr.shape[0] >= 2:
                 return arr[:2]
         except Exception:  # noqa: BLE001 - best-effort only
@@ -706,11 +871,11 @@ def Xform "OVGizmo"
 
         Anchors to the center of ovrtx's resolved world-space extent
         ('_worldExtent'), not the prim's local-to-world translation: several
-        real-world assets (this repo's Pot sample included) bake a large
-        offset into their mesh vertex data that a matching large translate
-        then cancels out, so the prim's own origin can sit far from where its
-        geometry actually appears. The extent's center is correct regardless
-        of how a given asset's pivot happens to be authored.
+        real-world assets bake a large offset into their mesh vertex data
+        that a matching large translate then cancels out, so the prim's own
+        origin can sit far from where its geometry actually appears. The
+        extent's center is correct regardless of how a given asset's pivot
+        happens to be authored.
         """
         attrs = self.prim_attrs.get(path, {})
         extent = self._read_extent_world(path, attrs)
@@ -726,8 +891,7 @@ def Xform "OVGizmo"
             if name not in attrs:
                 continue
             try:
-                tensor = self.renderer.read_attribute(name, [path])
-                arr = np.asarray(np.from_dlpack(tensor), dtype=np.float64).reshape(-1, 4, 4)[0]
+                arr = self._read_one(path, name).astype(np.float64).reshape(-1, 4, 4)[0]
                 return arr[3, 0:3].copy(), 0.0
             except Exception:  # noqa: BLE001 - best-effort only
                 continue
@@ -741,7 +905,7 @@ def Xform "OVGizmo"
         if not path or path not in self.prim_attrs:
             if self._gizmo_shown:
                 try:
-                    self.renderer.write_attribute([GIZMO_ROOT], "visibility", ["invisible"])
+                    self._write_token(GIZMO_ROOT, "visibility", "invisible")
                 except Exception:
                     log.exception("Failed to hide move gizmo")
                 self._gizmo_shown = False
@@ -751,17 +915,18 @@ def Xform "OVGizmo"
         scale = max(self.distance * GIZMO_SCALE_FACTOR, radius * 0.6, 1e-4)
         matrix = _compose_translate_scale_matrix(world_pos, scale).reshape(1, 4, 4)
         try:
-            self.renderer.write_attribute([GIZMO_ROOT], "omni:xform", matrix, semantic=Semantic.XFORM_MAT4x4)
+            self._write(GIZMO_ROOT, "omni:xform", matrix, is_array=False, semantic=ovstage.AttributeSemantic.MATRIX)
             if not self._gizmo_shown:
-                self.renderer.write_attribute([GIZMO_ROOT], "visibility", ["inherited"])
+                self._write_token(GIZMO_ROOT, "visibility", "inherited")
                 self._gizmo_shown = True
         except Exception:
             log.exception("Failed to update move gizmo")
 
     def _apply_selection_outline(self) -> None:
         """Keep the RTX selection-outline pass in sync with the selected prim:
-        clear the previous prim's outline group and assign the new one,
-        only when the selection actually changed."""
+        clear the previous prim's outline group and assign the new one, only
+        when the selection actually changed. Selection outlines stay on
+        ovrtx.Renderer even in attached mode (not deprecated, not rejected)."""
         path = self.selected_path if (self.selected_path in self.prim_attrs) else None
         if path == self._outlined_path:
             return
@@ -790,7 +955,9 @@ def Xform "OVGizmo"
             self._apply_camera()
             self._apply_gizmo()
             self._apply_selection_outline()
+            self._apply_animation(dt)
 
+            # Picking stays on ovrtx.Renderer even in attached mode.
             pick_rect = None
             if self._pending_pick is not None:
                 x, y = self._pending_pick
@@ -807,7 +974,9 @@ def Xform "OVGizmo"
                     pick_rect = None
 
             try:
-                products = self.renderer.step({RENDER_PRODUCT_PATH}, min(max(dt, 1.0 / 60.0), 1.0))
+                products = self.renderer.step(
+                    {RENDER_PRODUCT_PATH}, min(max(dt, 1.0 / 60.0), 1.0), ordinal=self.ordinal
+                )
             except Exception:
                 log.exception("step() failed")
                 return None, None

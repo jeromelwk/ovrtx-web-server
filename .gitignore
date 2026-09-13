@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .pip_check/
 *.log
+tasking-*.txt

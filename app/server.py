@@ -95,7 +95,7 @@ async def open_scene(req: OpenRequest):
     global last_dir
     last_dir = os.path.dirname(resolved)
 
-    return {"opened_path": resolved}
+    return {"opened_path": resolved, "anim_unsafe": session.anim_unsafe}
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +169,7 @@ async def ws_viewport(ws: WebSocket):
 
         last_fps_emit = time.monotonic()
         frames = 0
+        last_anim_sent = None
         try:
             while not stop.is_set():
                 jpeg_bytes, pick_result = await asyncio.to_thread(session.render_frame)
@@ -182,6 +183,16 @@ async def ws_viewport(ws: WebSocket):
                         "path": pick_result["path"],
                         "axis": pick_result["axis"],
                     }))
+                anim_state = (round(session.anim_time, 3), session.anim_playing)
+                if anim_state != last_anim_sent:
+                    await ws.send_text(json.dumps({
+                        "type": "anim",
+                        "time": session.anim_time,
+                        "duration": session.anim_duration,
+                        "playing": session.anim_playing,
+                        "unsafe": session.anim_unsafe,
+                    }))
+                    last_anim_sent = anim_state
                 frames += 1
                 now = time.monotonic()
                 if now - last_fps_emit > 1.0:

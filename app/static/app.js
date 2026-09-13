@@ -81,6 +81,51 @@ $("btnSettings").addEventListener("click", () => {
   console.info("Paramètres : à venir.");
 });
 
+// ---------------------------------------------------------------------------
+// Animation playback (play / pause / stop / timeline scrub)
+// ---------------------------------------------------------------------------
+const Anim = {
+  scrubbing: false,
+  unsafe: false,
+
+  init() {
+    $("btnAnimPlay").addEventListener("click", () => { if (!this.unsafe) Viewport.send({ type: "anim_play" }); });
+    $("btnAnimPause").addEventListener("click", () => Viewport.send({ type: "anim_pause" }));
+    $("btnAnimStop").addEventListener("click", () => Viewport.send({ type: "anim_stop" }));
+
+    const slider = $("animSlider");
+    slider.addEventListener("pointerdown", () => { this.scrubbing = true; });
+    slider.addEventListener("input", () => {
+      if (this.unsafe) return;
+      $("animTime").textContent = Number(slider.value).toFixed(1) + " s";
+      Viewport.send({ type: "anim_seek", time: Number(slider.value) });
+    });
+    const release = () => { this.scrubbing = false; };
+    slider.addEventListener("pointerup", release);
+    slider.addEventListener("pointercancel", release);
+  },
+
+  setUnsafe(unsafe) {
+    this.unsafe = unsafe;
+    $("animUnsafe").hidden = !unsafe;
+    $("btnAnimPlay").disabled = unsafe;
+    $("animSlider").disabled = unsafe;
+  },
+
+  update(state) {
+    if (state.unsafe !== undefined) this.setUnsafe(state.unsafe);
+    if (!this.scrubbing) {
+      $("animSlider").max = state.duration;
+      $("animSlider").value = state.time;
+      $("animTime").textContent = state.time.toFixed(1) + " s";
+    }
+    $("animDuration").textContent = state.duration.toFixed(1) + " s";
+    $("btnAnimPlay").classList.toggle("active", state.playing);
+    $("btnAnimPause").classList.toggle("active", !state.playing);
+  },
+};
+Anim.init();
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -114,6 +159,7 @@ async function openScene(path, chosen) {
     $("currentPath").title = data.opened_path;
     $("viewportOverlay").hidden = true;
     $("viewportHint").hidden = false;
+    Anim.setUnsafe(!!data.anim_unsafe);
     setStatus("prêt", "ok");
     await loadTreeRoot();
     Viewport.connect();
@@ -477,6 +523,8 @@ const Viewport = {
         const hud = $("viewportHud");
         hud.hidden = false;
         hud.textContent = `${msg.fps.toFixed(1)} fps · ${msg.width}×${msg.height}`;
+      } else if (msg.type === "anim") {
+        Anim.update(msg);
       } else if (msg.type === "error") {
         console.error("viewport error:", msg.message);
       }

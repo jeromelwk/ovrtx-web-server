@@ -54,6 +54,16 @@
       <div id="propsContainer"><div class="prop-empty">Sélectionnez un prim dans le viewer ou le graphe de scène.</div></div>
     </div>
   </div>
+
+  <div id="animBar">
+    <button id="btnAnimPlay" class="icon-btn" title="Lecture">▶</button>
+    <button id="btnAnimPause" class="icon-btn" title="Pause">⏸</button>
+    <button id="btnAnimStop" class="icon-btn" title="Stop">⏹</button>
+    <span id="animTime" class="anim-time">0.0 s</span>
+    <input id="animSlider" type="range" min="0" max="10" step="0.01" value="0" />
+    <span id="animDuration" class="anim-time">10.0 s</span>
+    <span id="animUnsafe" class="anim-unsafe" hidden title="La lecture est désactivée pour cette scène : ce moteur de rendu plante sur l'animation squelettique (UsdSkel).">⚠ Animation squelettique non prise en charge</span>
+  </div>
 </div>
 
 <div id="modalOverlay" hidden>
