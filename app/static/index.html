@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ovrtx USD Viewer</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div id="app">
+  <div id="toolbar">
+    <div class="toolbar-group">
+      <div class="menu-wrap">
+        <button id="btnMenu" class="icon-btn" title="Menu" aria-haspopup="true" aria-expanded="false">
+          <img src="/static/icons/menu.svg" alt="" />
+        </button>
+        <div id="menuDropdown" class="menu-dropdown" hidden>
+          <button id="btnOpenFile">Ouvrir un fichier…</button>
+          <button id="btnOpenFolder">Ouvrir un dossier…</button>
+        </div>
+      </div>
+      <img class="toolbar-logo" src="/static/logo_bycn.png" alt="Bouygues Construction" />
+    </div>
+
+    <div class="toolbar-center">
+      <span id="currentPath">Aucune scène ouverte</span>
+    </div>
+
+    <div class="toolbar-group">
+      <span id="statusBadge">inactif</span>
+      <button id="btnSettings" class="icon-btn" title="Paramètres">
+        <img src="/static/icons/settings.svg" alt="" />
+      </button>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="leftPane" class="pane">
+      <div class="pane-header">Graphe de scène</div>
+      <div id="treeContainer"><div class="tree-empty">Ouvrez un fichier USD pour afficher la hiérarchie des prims.</div></div>
+    </div>
+
+    <div id="viewportPane" class="pane">
+      <div id="viewportContainer">
+        <canvas id="viewportCanvas"></canvas>
+        <div id="viewportOverlay">Ouvrez un fichier .usd / .usda / .usdc / .usdz ou un dossier d'assets pour démarrer le rendu RTX.</div>
+        <div id="viewportHud" hidden></div>
+        <div id="viewportHint" hidden>glisser: orbiter&nbsp;·&nbsp;molette: zoom&nbsp;·&nbsp;shift+glisser: panoramique&nbsp;·&nbsp;clic: sélection</div>
+      </div>
+    </div>
+
+    <div id="rightPane" class="pane">
+      <div class="pane-header">Propriétés</div>
+      <div id="propsContainer"><div class="prop-empty">Sélectionnez un prim dans le viewer ou le graphe de scène.</div></div>
+    </div>
+  </div>
+</div>
+
+<div id="modalOverlay" hidden>
+  <div id="browserModal">
+    <div class="modal-header">
+      <span id="modalTitle">Plusieurs fichiers USD trouvés</span>
+      <button id="btnModalClose">✕</button>
+    </div>
+    <div class="modal-path">
+      <span id="modalCurrentPath"></span>
+    </div>
+    <div id="browserList"></div>
+    <div class="modal-footer">
+      <button id="btnModalCancel">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+9/22/17
+- Initial version of PointInstancedMedCity
+
+7/21/22
+- Updated all .usd crate binary files to version 0.8.0.
+- Replaced deprecated "add" list operations with "prepend".
