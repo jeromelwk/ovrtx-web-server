@@ -41,7 +41,6 @@ import ovrtx
 import ovstage
 from ovrtx import AttributeFilterMode, Device, FilterKind, RendererConfig, Semantic
 
-from .color_utils import hs_to_linear, kelvin_to_linear, rgb255_to_linear, xy_to_linear
 
 log = logging.getLogger("ovrtx_server.render_session")
 
@@ -126,19 +125,6 @@ _TFTYPE_TAG_NAMES = {
 
 _MIN_PITCH = math.radians(-89.0)
 _MAX_PITCH = math.radians(89.0)
-
-# Home Assistant light/presence-sensor bridge: which light prim types count as
-# an individually-controllable fixture (as opposed to scene/environment
-# illumination like a DomeLight HDRI skylight or a DistantLight sun stand-in,
-# which have no matching Home Assistant entity), the Mesh-name hints that flag
-# a placeholder prim as a motion/presence detector, and the per-type default
-# max-intensity calibration (area lights spread the same power over a much
-# larger surface than a point-like bulb, so need a correspondingly lower
-# ceiling to look comparably bright at brightness=255). Mirrors
-# omni.home.assistant's stage_scan.py.
-_HA_FIXTURE_LIGHT_TYPES = ("SphereLight", "RectLight", "DiskLight", "CylinderLight")
-_HA_PRESENCE_NAME_HINTS = ("mouvement", "detecteur", "motion", "presence")
-_HA_DEFAULT_MAX_INTENSITY_BY_LIGHT_TYPE = {"RectLight": 350.0, "DiskLight": 350.0}
 
 
 def _as_int(value) -> int:
@@ -673,119 +659,6 @@ def Xform "OVGizmo"
             except Exception:  # noqa: BLE001 - best-effort prefill only
                 continue
         return {"translate": [0.0, 0.0, 0.0], "rotate": [0.0, 0.0, 0.0]}
-
-    # ------------------------------------------------------------------
-    # Home Assistant MQTT bridge: scene scanning + attribute application.
-    # See app/ha_bridge.py for the MQTT client and mapping management this
-    # feeds; this side only knows how to detect candidate prims and write the
-    # resulting light/visibility state onto them.
-    # ------------------------------------------------------------------
-    def scan_lights_and_sensors(self) -> list[dict[str, Any]]:
-        """Every fixture-light prim and motion/presence-sensor-looking Mesh in
-        the open scene, each with a suggested Home Assistant MQTT topic prefix
-        derived from the prim's own name (the convention observed on the
-        reference house's broker: a light prim's name equals its HA entity
-        id)."""
-        with self._lock:
-            if not self.is_open:
-                return []
-            out: list[dict[str, Any]] = []
-            for path, type_name in self.prim_types.items():
-                name = path.rsplit("/", 1)[-1]
-                if type_name in _HA_FIXTURE_LIGHT_TYPES:
-                    out.append({
-                        "prim_path": path,
-                        "kind": "light",
-                        "topic_prefix": f"homeassistant/light/{name}",
-                        "max_intensity": _HA_DEFAULT_MAX_INTENSITY_BY_LIGHT_TYPE.get(type_name, 31000.0),
-                    })
-                elif type_name == "Mesh" and any(hint in name.lower() for hint in _HA_PRESENCE_NAME_HINTS):
-                    out.append({
-                        "prim_path": path,
-                        "kind": "presence",
-                        "topic_prefix": f"homeassistant/binary_sensor/{name}",
-                        "max_intensity": 0.0,
-                    })
-            return out
-
-    def apply_light_state(
-        self, path: str, data: dict[str, Any], max_intensity: float = 1000.0, max_exposure: float = 0.0
-    ) -> bool:
-        """Apply a decoded Home Assistant light-state dict onto a UsdLux prim's
-        intensity/exposure/color. Each attribute write is independently
-        best-effort: a prim that lacks e.g. an authored `inputs:exposure`
-        should not block the intensity/color writes that do apply."""
-        with self._lock:
-            if not self.is_open or path not in self.prim_attrs:
-                return False
-
-            state = str(data.get("state", "off")).lower()
-            brightness = data.get("brightness")
-            if state == "on":
-                brightness_norm = (brightness / 255.0) if isinstance(brightness, (int, float)) else 1.0
-                intensity = brightness_norm * max_intensity
-                exposure = brightness_norm * max_exposure
-            else:
-                # Covers "off" as well as anything else HA can report (e.g.
-                # "unavailable"/"unknown"): only a confirmed "on" lights up the prim.
-                intensity = 0.0
-                exposure = 0.0
-
-            try:
-                self._write(path, "inputs:intensity", np.array([intensity], dtype=np.float32))
-            except Exception:
-                log.debug("No writable inputs:intensity on %s", path, exc_info=True)
-            try:
-                self._write(path, "inputs:exposure", np.array([exposure], dtype=np.float32))
-            except Exception:
-                log.debug("No writable inputs:exposure on %s", path, exc_info=True)
-
-            rgb_color = data.get("rgb_color")
-            xy = data.get("xy_color")
-            hs = data.get("hs_color")
-            color_temp_kelvin = data.get("color_temp_kelvin")
-
-            rgb = None
-            if isinstance(rgb_color, (list, tuple)) and len(rgb_color) == 3:
-                rgb = rgb255_to_linear((float(rgb_color[0]), float(rgb_color[1]), float(rgb_color[2])))
-            elif isinstance(xy, (list, tuple)) and len(xy) == 2:
-                rgb = xy_to_linear((float(xy[0]), float(xy[1])))
-            elif isinstance(hs, (list, tuple)) and len(hs) == 2:
-                rgb = hs_to_linear((float(hs[0]), float(hs[1])))
-            elif isinstance(color_temp_kelvin, (int, float)):
-                rgb = kelvin_to_linear(float(color_temp_kelvin))
-
-            if rgb is not None:
-                try:
-                    self._write(path, "inputs:enableColorTemperature", np.array([False]))
-                    self._write(path, "inputs:color", np.array([rgb], dtype=np.float32))
-                except Exception:
-                    log.debug("No writable inputs:color on %s", path, exc_info=True)
-
-            if isinstance(color_temp_kelvin, (int, float)):
-                try:
-                    self._write(path, "inputs:colorTemperature", np.array([float(color_temp_kelvin)], dtype=np.float32))
-                except Exception:
-                    log.debug("No writable inputs:colorTemperature on %s", path, exc_info=True)
-
-            return True
-
-    def apply_presence_state(self, path: str, data: dict[str, Any]) -> bool:
-        """Show/hide a prim based on a Home Assistant binary_sensor's `state`
-        field ("on" -> visible, "off" -> hidden), used for motion/presence
-        detectors represented as a placeholder prim in the scene."""
-        with self._lock:
-            if not self.is_open or path not in self.prim_attrs:
-                return False
-            state = str(data.get("state", "")).lower()
-            if state not in ("on", "off"):
-                return False
-            try:
-                self._write_token(path, "visibility", "inherited" if state == "on" else "invisible")
-            except Exception:
-                log.exception("Failed to write visibility on %s", path)
-                return False
-            return True
 
     def set_prim_transform(self, path: str, translate: list[float], rotate_deg: list[float]) -> None:
         """Replace a prim's local transform with the given translation

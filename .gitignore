@@ -3,5 +3,4 @@ __pycache__/
 .pip_check/
 *.log
 tasking-*.txt
-app/ha_state.json
 .venv/

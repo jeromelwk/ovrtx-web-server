@@ -15,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import file_browser, native_dialog
-from .ha_bridge import ConnectionSettings, HomeAssistantBridge
 from .render_session import RenderSession
 
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +28,6 @@ app = FastAPI(title="ovrtx USD Viewer")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 session = RenderSession()
-ha_bridge = HomeAssistantBridge(session)
 
 # Remembers the last folder opened (file's parent, or the folder itself) so the
 # native Explorer dialog reopens where the user left off.
@@ -97,14 +95,9 @@ async def open_scene(req: OpenRequest):
     global last_dir
     last_dir = os.path.dirname(resolved)
 
-    # Mirrors omni.home.assistant's behavior on a stage-open event: mappings
-    # saved earlier for this same scene path are restored automatically.
-    await asyncio.to_thread(ha_bridge.load_mappings_for_scene, resolved)
-
     return {
         "opened_path": resolved,
         "anim_unsafe": session.anim_unsafe,
-        "ha_mapping_count": len(ha_bridge.mappings),
     }
 
 
@@ -145,123 +138,6 @@ async def set_transform(req: TransformRequest):
         log.exception("Failed to set transform on %s", req.path)
         return JSONResponse({"detail": str(exc)}, status_code=500)
     return {"ok": True}
-
-
-# ---------------------------------------------------------------------------
-# Home Assistant MQTT bridge (see app/ha_bridge.py)
-# ---------------------------------------------------------------------------
-class HAConnectionRequest(BaseModel):
-    host: str
-    port: int = 1883
-    username: str = ""
-    password: str = ""
-    tls_enabled: bool = False
-    topic_filter: str = "#"
-    qos: int = 0
-
-
-class HAMappingRequest(BaseModel):
-    prim_path: str
-    topic_prefix: str
-    kind: str = "light"
-    max_intensity: float = 31000.0
-    max_exposure: float = 0.0
-
-
-class HAMappingRemoveRequest(BaseModel):
-    topic_prefix: str
-
-
-def _ha_conn_from_request(req: HAConnectionRequest) -> ConnectionSettings:
-    return ConnectionSettings(
-        host=req.host.strip(),
-        port=req.port,
-        username=req.username.strip(),
-        password=req.password,
-        tls_enabled=req.tls_enabled,
-        topic_filter=req.topic_filter.strip() or "#",
-        qos=req.qos,
-    )
-
-
-@app.get("/api/ha/connection")
-async def ha_get_connection():
-    c = ha_bridge.conn
-    return {
-        "host": c.host, "port": c.port, "username": c.username, "password": c.password,
-        "tls_enabled": c.tls_enabled, "topic_filter": c.topic_filter, "qos": c.qos,
-    }
-
-
-@app.post("/api/ha/connection")
-async def ha_save_connection(req: HAConnectionRequest):
-    ha_bridge.save_connection(_ha_conn_from_request(req))
-    return {"ok": True}
-
-
-@app.post("/api/ha/connect")
-async def ha_connect(req: HAConnectionRequest):
-    ha_bridge.save_connection(_ha_conn_from_request(req))
-    try:
-        await asyncio.to_thread(ha_bridge.connect)
-    except Exception as exc:  # noqa: BLE001 - surface connection failures to the UI
-        log.exception("Failed to connect to MQTT broker")
-        return JSONResponse({"detail": str(exc)}, status_code=500)
-    return {"ok": True}
-
-
-@app.post("/api/ha/disconnect")
-async def ha_disconnect():
-    await asyncio.to_thread(ha_bridge.disconnect)
-    return {"ok": True}
-
-
-@app.get("/api/ha/status")
-async def ha_status():
-    return ha_bridge.status()
-
-
-@app.get("/api/ha/mappings")
-async def ha_list_mappings():
-    return ha_bridge.to_list()
-
-
-@app.post("/api/ha/mappings")
-async def ha_add_mapping(req: HAMappingRequest):
-    if not req.prim_path or not req.topic_prefix:
-        return JSONResponse({"detail": "prim_path et topic_prefix sont requis"}, status_code=400)
-    ha_bridge.add_mapping(req.prim_path, req.topic_prefix, req.kind, req.max_intensity, req.max_exposure)
-    return {"ok": True}
-
-
-@app.post("/api/ha/mappings/remove")
-async def ha_remove_mapping(req: HAMappingRemoveRequest):
-    ha_bridge.remove_mapping(req.topic_prefix)
-    return {"ok": True}
-
-
-@app.post("/api/ha/mappings/detect")
-async def ha_detect_mappings():
-    if not session.is_open:
-        return JSONResponse({"detail": "Aucune scène ouverte"}, status_code=400)
-    count = await asyncio.to_thread(ha_bridge.detect_from_scene)
-    return {"count": count, "mappings": ha_bridge.to_list()}
-
-
-@app.post("/api/ha/mappings/save")
-async def ha_save_mappings():
-    if not session.source_path:
-        return JSONResponse({"detail": "Aucune scène ouverte"}, status_code=400)
-    ha_bridge.save_mappings_for_scene(session.source_path)
-    return {"ok": True}
-
-
-@app.post("/api/ha/mappings/load")
-async def ha_load_mappings():
-    if not session.source_path:
-        return JSONResponse({"detail": "Aucune scène ouverte"}, status_code=400)
-    ha_bridge.load_mappings_for_scene(session.source_path)
-    return {"mappings": ha_bridge.to_list()}
 
 
 # ---------------------------------------------------------------------------
