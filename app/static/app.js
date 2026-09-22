@@ -76,9 +76,9 @@ $("btnOpenFolder").addEventListener("click", async () => {
   }
 });
 
-// Placeholder: no settings panel exists yet.
 $("btnSettings").addEventListener("click", () => {
-  console.info("Paramètres : à venir.");
+  closeMenu();
+  HomeAssistant.open();
 });
 
 // ---------------------------------------------------------------------------
@@ -395,6 +395,212 @@ function fmt(v) {
 }
 
 // ---------------------------------------------------------------------------
+// Home Assistant MQTT bridge panel (opened from the toolbar's gear icon)
+// ---------------------------------------------------------------------------
+const HomeAssistant = {
+  statusTimer: null,
+
+  init() {
+    $("btnHaClose").addEventListener("click", () => this.close());
+    $("haOverlay").addEventListener("click", (e) => { if (e.target.id === "haOverlay") this.close(); });
+
+    $("btnHaConnect").addEventListener("click", () => this.onConnectClicked());
+    $("btnHaSaveConn").addEventListener("click", () => this.saveConnection());
+    $("btnHaDetect").addEventListener("click", () => this.detect());
+    $("btnHaUseSelection").addEventListener("click", () => {
+      if (Tree.selectedPath) $("haPrimPath").value = Tree.selectedPath;
+    });
+    $("btnHaAddMapping").addEventListener("click", () => this.addMapping());
+    $("btnHaLoad").addEventListener("click", () => this.loadMappings());
+    $("btnHaSave").addEventListener("click", () => this.saveMappings());
+  },
+
+  async open() {
+    $("haOverlay").hidden = false;
+    await this.loadConnection();
+    await this.refreshStatus();
+    await this.refreshMappings();
+    if (!this.statusTimer) {
+      this.statusTimer = setInterval(() => this.refreshStatus(), 3000);
+    }
+  },
+
+  close() {
+    $("haOverlay").hidden = true;
+    if (this.statusTimer) {
+      clearInterval(this.statusTimer);
+      this.statusTimer = null;
+    }
+  },
+
+  async loadConnection() {
+    try {
+      const c = await api("/api/ha/connection");
+      $("haHost").value = c.host || "";
+      $("haPort").value = c.port || 1883;
+      $("haUser").value = c.username || "";
+      $("haPassword").value = c.password || "";
+      $("haTls").checked = !!c.tls_enabled;
+      $("haTopicFilter").value = c.topic_filter || "#";
+      $("haQos").value = String(c.qos || 0);
+    } catch (err) {
+      console.error(err);
+    }
+  },
+
+  readConnection() {
+    return {
+      host: $("haHost").value.trim(),
+      port: parseInt($("haPort").value, 10) || 1883,
+      username: $("haUser").value.trim(),
+      password: $("haPassword").value,
+      tls_enabled: $("haTls").checked,
+      topic_filter: $("haTopicFilter").value.trim() || "#",
+      qos: parseInt($("haQos").value, 10) || 0,
+    };
+  },
+
+  async saveConnection() {
+    try {
+      await api("/api/ha/connection", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.readConnection()),
+      });
+    } catch (err) {
+      alert("Erreur : " + err.message);
+    }
+  },
+
+  async onConnectClicked() {
+    const status = await api("/api/ha/status").catch(() => ({ connected: false }));
+    if (status.connected) {
+      await api("/api/ha/disconnect", { method: "POST" });
+      await this.refreshStatus();
+      return;
+    }
+    $("btnHaConnect").disabled = true;
+    try {
+      await api("/api/ha/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.readConnection()),
+      });
+    } catch (err) {
+      alert("Connexion échouée : " + err.message);
+    } finally {
+      $("btnHaConnect").disabled = false;
+      await this.refreshStatus();
+    }
+  },
+
+  async refreshStatus() {
+    try {
+      const s = await api("/api/ha/status");
+      $("haStatusDot").classList.toggle("connected", !!s.connected);
+      $("haStatusText").textContent = s.connected ? "Connecté" : "Déconnecté";
+      $("btnHaConnect").textContent = s.connected ? "Se déconnecter" : "Se connecter";
+    } catch (err) {
+      console.error(err);
+    }
+  },
+
+  async detect() {
+    try {
+      const data = await api("/api/ha/mappings/detect", { method: "POST" });
+      this.renderMappings(data.mappings);
+    } catch (err) {
+      alert("Erreur : " + err.message);
+    }
+  },
+
+  async addMapping() {
+    const kind = $("haKind").value;
+    const prim_path = $("haPrimPath").value.trim();
+    const topic_prefix = $("haTopicPrefix").value.trim().replace(/\/+$/, "");
+    const max_intensity = parseFloat($("haMaxIntensity").value) || 0;
+    if (!prim_path || !topic_prefix) {
+      alert("Le prim cible et le topic de base sont requis.");
+      return;
+    }
+    try {
+      await api("/api/ha/mappings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prim_path, topic_prefix, kind, max_intensity, max_exposure: 0 }),
+      });
+      await this.refreshMappings();
+    } catch (err) {
+      alert("Erreur : " + err.message);
+    }
+  },
+
+  async removeMapping(topic_prefix) {
+    try {
+      await api("/api/ha/mappings/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic_prefix }),
+      });
+      await this.refreshMappings();
+    } catch (err) {
+      alert("Erreur : " + err.message);
+    }
+  },
+
+  async loadMappings() {
+    try {
+      const data = await api("/api/ha/mappings/load", { method: "POST" });
+      this.renderMappings(data.mappings);
+    } catch (err) {
+      alert("Erreur : " + err.message);
+    }
+  },
+
+  async saveMappings() {
+    try {
+      await api("/api/ha/mappings/save", { method: "POST" });
+    } catch (err) {
+      alert("Erreur : " + err.message);
+    }
+  },
+
+  async refreshMappings() {
+    try {
+      const mappings = await api("/api/ha/mappings");
+      this.renderMappings(mappings);
+    } catch (err) {
+      console.error(err);
+    }
+  },
+
+  renderMappings(mappings) {
+    const container = $("haMappingList");
+    container.innerHTML = "";
+    if (!mappings || !mappings.length) {
+      container.innerHTML = '<div class="ha-mapping-empty">(aucun mapping)</div>';
+      return;
+    }
+    for (const m of mappings) {
+      const row = document.createElement("div");
+      row.className = "ha-mapping-row";
+      row.innerHTML = `
+        <span class="ha-kind">${m.kind === "presence" ? "détecteur" : "lumière"}</span>
+        <span class="ha-prim" title="${escapeHtml(m.prim_path)}">${escapeHtml(m.prim_path)}</span>
+        <span class="ha-topic" title="${escapeHtml(m.topic_prefix)}">${escapeHtml(m.topic_prefix)}</span>
+      `;
+      const removeBtn = document.createElement("button");
+      removeBtn.className = "ha-remove";
+      removeBtn.textContent = "✕";
+      removeBtn.addEventListener("click", () => this.removeMapping(m.topic_prefix));
+      row.appendChild(removeBtn);
+      container.appendChild(row);
+    }
+  },
+};
+HomeAssistant.init();
+
+// ---------------------------------------------------------------------------
 // Viewport (center pane): WebSocket-streamed RTX frames + camera controls
 // ---------------------------------------------------------------------------
 const Viewport = {
@@ -551,7 +757,9 @@ window.addEventListener("keydown", (e) => {
   if (tag === "INPUT" || tag === "TEXTAREA") return;
 
   if (e.key === "Escape") {
-    if (!$("modalOverlay").hidden) {
+    if (!$("haOverlay").hidden) {
+      HomeAssistant.close();
+    } else if (!$("modalOverlay").hidden) {
       closeModal();
     } else if (!$("menuDropdown").hidden) {
       closeMenu();
@@ -564,3 +772,10 @@ window.addEventListener("keydown", (e) => {
 });
 
 Viewport.init();
+
+// ---------------------------------------------------------------------------
+// Optional auto-open via ?open=<path> (used when launching the server
+// straight into a given scene instead of requiring a manual File > Open).
+// ---------------------------------------------------------------------------
+const _autoOpenPath = new URLSearchParams(location.search).get("open");
+if (_autoOpenPath) openScene(_autoOpenPath);
