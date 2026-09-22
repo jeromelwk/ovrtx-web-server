@@ -87,11 +87,21 @@ $("btnSettings").addEventListener("click", () => {
 const Anim = {
   scrubbing: false,
   unsafe: false,
+  playing: false,
+  loop: true,
 
   init() {
-    $("btnAnimPlay").addEventListener("click", () => { if (!this.unsafe) Viewport.send({ type: "anim_play" }); });
-    $("btnAnimPause").addEventListener("click", () => Viewport.send({ type: "anim_pause" }));
+    $("btnAnimPlayPause").addEventListener("click", () => {
+      if (this.playing) {
+        Viewport.send({ type: "anim_pause" });
+      } else if (!this.unsafe) {
+        Viewport.send({ type: "anim_play" });
+      }
+    });
     $("btnAnimStop").addEventListener("click", () => Viewport.send({ type: "anim_stop" }));
+    $("btnAnimLoop").addEventListener("click", () => {
+      Viewport.send({ type: "anim_loop", value: !this.loop });
+    });
 
     const slider = $("animSlider");
     slider.addEventListener("pointerdown", () => { this.scrubbing = true; });
@@ -108,20 +118,30 @@ const Anim = {
   setUnsafe(unsafe) {
     this.unsafe = unsafe;
     $("animUnsafe").hidden = !unsafe;
-    $("btnAnimPlay").disabled = unsafe;
+    $("btnAnimPlayPause").disabled = unsafe;
     $("animSlider").disabled = unsafe;
   },
 
   update(state) {
     if (state.unsafe !== undefined) this.setUnsafe(state.unsafe);
+    const start = state.start || 0;
     if (!this.scrubbing) {
-      $("animSlider").max = state.duration;
+      $("animSlider").min = start;
+      $("animSlider").max = start + state.duration;
       $("animSlider").value = state.time;
       $("animTime").textContent = state.time.toFixed(1) + " s";
     }
     $("animDuration").textContent = state.duration.toFixed(1) + " s";
-    $("btnAnimPlay").classList.toggle("active", state.playing);
-    $("btnAnimPause").classList.toggle("active", !state.playing);
+    this.playing = state.playing;
+    const btn = $("btnAnimPlayPause");
+    btn.textContent = state.playing ? "⏸" : "▶";
+    btn.title = state.playing ? "Pause" : "Lecture";
+    btn.classList.toggle("active", state.playing);
+
+    if (state.loop !== undefined) {
+      this.loop = state.loop;
+      $("btnAnimLoop").classList.toggle("active", state.loop);
+    }
   },
 };
 Anim.init();

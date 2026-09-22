@@ -310,13 +310,15 @@ async def ws_viewport(ws: WebSocket):
                         "path": pick_result["path"],
                         "axis": pick_result["axis"],
                     }))
-                anim_state = (round(session.anim_time, 3), session.anim_playing)
+                anim_state = (round(session.anim_time, 3), session.anim_playing, session.anim_loop)
                 if anim_state != last_anim_sent:
                     await ws.send_text(json.dumps({
                         "type": "anim",
                         "time": session.anim_time,
+                        "start": session.anim_start,
                         "duration": session.anim_duration,
                         "playing": session.anim_playing,
+                        "loop": session.anim_loop,
                         "unsafe": session.anim_unsafe,
                     }))
                     last_anim_sent = anim_state

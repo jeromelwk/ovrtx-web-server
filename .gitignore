@@ -4,3 +4,4 @@ __pycache__/
 *.log
 tasking-*.txt
 app/ha_state.json
+.venv/

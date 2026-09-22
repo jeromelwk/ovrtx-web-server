@@ -24,9 +24,12 @@ writes, population and the animation clock now go through the native
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Optional
@@ -68,9 +71,29 @@ GIZMO_SCALE_FACTOR = 0.05  # world-space gizmo size per unit of camera distance
 
 _SELECTION_GROUP = 1  # ovrtx selection-outline group id used for the selected prim
 
-ANIM_DEFAULT_DURATION = 10.0  # seconds; ovrtx has no API to read a stage's authored
-# startTimeCode/endTimeCode/timeCodesPerSecond, so the timeline uses this fixed
-# default range rather than one derived from the file.
+ANIM_DEFAULT_DURATION = 10.0  # seconds; fallback used when the stage's authored
+# startTimeCode/endTimeCode/timeCodesPerSecond can't be probed (see
+# _probe_anim_range): ovrtx/ovstage expose no API for that stage metadata, so
+# it's read out-of-process with the standalone 'usd-core' PyPI package instead
+# -- never imported in this process, since its bundled OpenUSD runtime would
+# collide with the one ovrtx/ovstage already load here.
+ANIM_RANGE_PROBE_TIMEOUT = 20.0  # seconds; generous since a cold subprocess launch is slow
+
+_ANIM_RANGE_PROBE_SCRIPT = r"""
+import json, sys
+try:
+    from pxr import Usd
+    stage = Usd.Stage.Open(sys.argv[1], load=Usd.Stage.LoadNone)
+    if not stage.HasAuthoredTimeCodeRange():
+        raise ValueError("no authored time-code range")
+    start, end = stage.GetStartTimeCode(), stage.GetEndTimeCode()
+    fps = stage.GetTimeCodesPerSecond() or 24.0
+    if end <= start or fps <= 0:
+        raise ValueError("empty or invalid time-code range")
+    print(json.dumps({"ok": True, "start": start / fps, "end": end / fps}))
+except Exception as exc:
+    print(json.dumps({"ok": False, "error": str(exc)}))
+"""
 
 # Prims authored by us to host the camera / render config / fallback lighting /
 # move gizmo, plus internal bookkeeping prims injected by the ovrtx/Fabric
@@ -246,10 +269,16 @@ class RenderSession:
         self._gizmo_shown = False
         self._outlined_path: Optional[str] = None
 
-        # Animation playback state.
+        # Animation playback state. anim_start/anim_duration delimit the
+        # authored playback range in seconds (probed from the USD stage's
+        # startTimeCode/endTimeCode/timeCodesPerSecond metadata -- see
+        # _probe_anim_range -- falling back to a fixed guess when that
+        # metadata can't be read).
         self.anim_time = 0.0
+        self.anim_start = 0.0
         self.anim_duration = ANIM_DEFAULT_DURATION
         self.anim_playing = False
+        self.anim_loop = True
         self.anim_unsafe = False
         self._anim_dirty = True
 
@@ -350,6 +379,28 @@ class RenderSession:
         finally:
             self.stage.release_read(read).wait()
 
+    @staticmethod
+    def _probe_anim_range(path: str) -> tuple[float, float]:
+        """Best-effort (start_seconds, duration_seconds) for the stage's authored
+        playback range, read out-of-process via 'usd-core' (see the module-level
+        comment on ANIM_DEFAULT_DURATION). Falls back to (0.0, ANIM_DEFAULT_DURATION)
+        on any failure: missing/unreadable metadata, a malformed asset (e.g. some
+        non-standard .usdz packages), a missing 'usd-core' install, or a timeout.
+        """
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", _ANIM_RANGE_PROBE_SCRIPT, path],
+                capture_output=True, text=True, timeout=ANIM_RANGE_PROBE_TIMEOUT,
+            )
+            payload = json.loads(result.stdout.strip().splitlines()[-1])
+            if payload.get("ok"):
+                start, end = float(payload["start"]), float(payload["end"])
+                return start, end - start
+            log.info("No authored anim range for %s: %s", path, payload.get("error"))
+        except Exception:
+            log.exception("Failed to probe anim range for %s", path)
+        return 0.0, ANIM_DEFAULT_DURATION
+
     def open_usd(self, path: str, width: int, height: int) -> None:
         with self._lock:
             self._ensure_renderer()
@@ -373,7 +424,8 @@ class RenderSession:
             self._gizmo_state = None
             self._gizmo_shown = False
             self._outlined_path = None
-            self.anim_time = 0.0
+            self.anim_start, self.anim_duration = self._probe_anim_range(path)
+            self.anim_time = self.anim_start
             self.anim_playing = False
             self._anim_dirty = True
             # Safety guard: driving the animation clock (update_from_usd_time)
@@ -897,11 +949,14 @@ def Xform "OVGizmo"
                 self.anim_playing = False
             elif kind == "anim_stop":
                 self.anim_playing = False
-                self.anim_time = 0.0
+                self.anim_time = self.anim_start
                 self._anim_dirty = True
             elif kind == "anim_seek":
-                self.anim_time = max(0.0, min(self.anim_duration, float(msg.get("time", 0.0))))
+                end = self.anim_start + self.anim_duration
+                self.anim_time = max(self.anim_start, min(end, float(msg.get("time", 0.0))))
                 self._anim_dirty = True
+            elif kind == "anim_loop":
+                self.anim_loop = bool(msg.get("value", True))
 
     def _frame_selected(self) -> None:
         """Re-center and dolly the camera onto the selected prim (the 'F' shortcut)."""
@@ -968,8 +1023,14 @@ def Xform "OVGizmo"
             return
         if self.anim_playing:
             self.anim_time += dt
-            if self.anim_time > self.anim_duration:
-                self.anim_time = self.anim_time % max(self.anim_duration, 1e-6)
+            end = self.anim_start + self.anim_duration
+            if self.anim_time > end:
+                if self.anim_loop:
+                    span = max(self.anim_duration, 1e-6)
+                    self.anim_time = self.anim_start + (self.anim_time - self.anim_start) % span
+                else:
+                    self.anim_time = end
+                    self.anim_playing = False
             self._anim_dirty = True
         if not self._anim_dirty:
             return
