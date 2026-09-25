@@ -1,0 +1,29 @@
+#usda 1.0
+(
+    customLayerData = {
+        string License = "CC BY 4.0"
+        string Version = "1.1"
+    }
+    defaultPrim = "standard_shader_ball_scene"
+    framesPerSecond = 24
+    metersPerUnit = 0.01
+    timeCodesPerSecond = 24
+    upAxis = "Y"
+)
+
+def Xform "standard_shader_ball_scene"
+{
+    def Camera "camera"
+    {
+        float2 clippingRange = (0.1, 1000)
+        float focalLength = 50
+        float horizontalAperture = 20.955
+        token projection = "perspective"
+        float verticalAperture = 20.955
+        float3 xformOp:rotateXYZ = (-40.1, 20, 0)
+        double3 xformOp:translate = (6.53154, 19.5, 17.9485)
+        float3 xformOp:translate:pivot = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:translate:pivot", "xformOp:rotateXYZ", "!invert!xformOp:translate:pivot"]
+    }
+}
+
